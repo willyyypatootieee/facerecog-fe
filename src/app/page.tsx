@@ -45,6 +45,7 @@ export default function Home() {
       }
     }
     getDevices();
+    console.log(getDevices);
   }, []);
 
   useEffect(() => {
