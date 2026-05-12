@@ -4,11 +4,26 @@ import React, { useEffect, useRef, useState } from "react";
 import * as faceapi from "@vladmandic/face-api";
 
 export default function Home() {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDevice, setSelectedDevice] = useState<string>("");
+  type ScanState = "idle" | "detecting" | "extracting" | "verifying" | "success" | "error";
+  const [scanState, setScanState] = useState<ScanState>("idle");
+  const scanStateRef = useRef<ScanState>("idle");
+  const [simData, setSimData] = useState<number[]>([]);
+  const simDataRef = useRef<number[]>([]);
+  const [verifiedName, setVerifiedName] = useState<string>("");
+
+  useEffect(() => {
+    scanStateRef.current = scanState;
+  }, [scanState]);
+  
+  useEffect(() => {
+    simDataRef.current = simData;
+  }, [simData]);
+
+  const [devices] = useState<number[]>([0, 1, 2, 3]);
+  const [selectedDevice, setSelectedDevice] = useState<number>(0);
   const [name, setName] = useState<string>("");
   const [status, setStatus] = useState<{ type: "success" | "error" | "info" | null; msg: string }>({ type: null, msg: "" });
   const [modelsLoaded, setModelsLoaded] = useState(false);
@@ -30,62 +45,36 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    // Enumerate devices
-    async function getDevices() {
-      try {
-        await navigator.mediaDevices.getUserMedia({ video: true });
-        const allDevices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = allDevices.filter((d) => d.kind === "videoinput");
-        setDevices(videoDevices);
-        if (videoDevices.length > 0) {
-          setSelectedDevice(videoDevices[0].deviceId);
-        }
-      } catch (err) {
-        console.error("Error enumerating devices:", err);
-      }
-    }
-    getDevices();
-    console.log(getDevices);
-  }, []);
-
-  useEffect(() => {
-    if (selectedDevice && videoRef.current) {
-      navigator.mediaDevices
-        .getUserMedia({
-          video: { deviceId: selectedDevice ? { exact: selectedDevice } : undefined },
-        })
-        .then((stream) => {
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-          }
-        })
-        .catch((err) => {
-          console.error("Error accessing webcam:", err);
-          setStatus({ type: "error", msg: "Could not access the selected camera." });
-        });
-    }
+    // Notify backend to change camera index
+    fetch(`http://localhost:8000/set_camera/${selectedDevice}`, { method: 'POST' })
+      .catch(err => console.error("Error setting camera:", err));
   }, [selectedDevice]);
 
-  // Handle Video Play - Start tracking faces
-  const handleVideoPlay = () => {
-    if (!videoRef.current || !canvasRef.current || !modelsLoaded) return;
+  // Ensure detection loop starts if models load after the stream connects
+  useEffect(() => {
+    if (modelsLoaded && imageRef.current && imageRef.current.complete) {
+      handleImageLoad();
+    }
+  }, [modelsLoaded]);
 
-    const video = videoRef.current;
+  // Handle Image Load - Start tracking faces on the MJPEG stream
+  const handleImageLoad = () => {
+    if (!imageRef.current || !canvasRef.current || !modelsLoaded) return;
+
+    const img = imageRef.current;
     const canvas = canvasRef.current;
     
-    // Set canvas dimensions to match video
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const displaySize = { width: video.videoWidth, height: video.videoHeight };
+    // Set canvas dimensions to match image
+    canvas.width = img.width || 640;
+    canvas.height = img.height || 480;
+    const displaySize = { width: canvas.width, height: canvas.height };
     faceapi.matchDimensions(canvas, displaySize);
 
     let animationFrameId: number;
 
     const detectAndDraw = async () => {
-      if (video.paused || video.ended) return;
-
       const detection = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.3 }))
+        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
         .withFaceLandmarks();
 
       const ctx = canvas.getContext("2d");
@@ -95,17 +84,68 @@ export default function Home() {
 
       if (detection) {
         const resizedResult = faceapi.resizeResults(detection, displaySize);
-        // Draw the landmarks (the dots thingy)
-        // Custom draw options to look like an IR dot projector
-        const drawOptions = {
-          color: '#ef4444', // Red-ish IR color
-          lineWidth: 2,
-          drawLines: true,
-          drawPoints: true,
-          pointSize: 3,
-        };
-        const drawLandmarks = new faceapi.draw.DrawFaceLandmarks(resizedResult.landmarks, drawOptions);
-        drawLandmarks.draw(canvas);
+        const { box } = resizedResult.detection;
+        
+        if (ctx) {
+          // Draw the landmarks (the dots thingy)
+          // Custom draw options to look like an IR dot projector
+          const drawOptions = {
+            color: '#ef4444', // Red-ish IR color
+            lineWidth: 2,
+            drawLines: true,
+            drawPoints: true,
+            pointSize: 3,
+          };
+          const drawLandmarks = new faceapi.draw.DrawFaceLandmarks(resizedResult.landmarks, drawOptions);
+          drawLandmarks.draw(canvas);
+          
+          const state = scanStateRef.current;
+          
+          if (state !== 'idle' && state !== 'success' && state !== 'error') {
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+            // Draw a scanning line moving down the box
+            const time = Date.now();
+            const scanLineY = box.y + ((time / 10) % box.height);
+            ctx.beginPath();
+            ctx.moveTo(box.x, scanLineY);
+            ctx.lineTo(box.x + box.width, scanLineY);
+            ctx.strokeStyle = 'rgba(239, 68, 68, 0.8)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // Draw some "matrix" numbers around the box
+            ctx.font = "12px monospace";
+            ctx.fillStyle = "rgba(239, 68, 68, 0.9)";
+            
+            // Note: Since the canvas is horizontally flipped via CSS (scale-x-[-1]), 
+            // text drawn on it would appear backward. To fix this, we can flip the context for text,
+            // or just let it be mirrored like a true raw IR feed. Let's flip it back for text.
+            ctx.save();
+            // Translate to the center of the box, flip, then draw
+            ctx.translate(box.x + box.width / 2, box.y + box.height / 2);
+            ctx.scale(-1, 1);
+            // Now coordinates are relative to the center of the box, but flipped
+            const textX = -box.width / 2;
+            const textY = -box.height / 2;
+            
+            ctx.fillText(`CONF: ${(detection.detection.score * 100).toFixed(2)}%`, textX, textY - 10);
+            if (state === 'extracting' || state === 'verifying') {
+                ctx.fillText(`EXTRACTING 128D VECTOR...`, textX, textY + box.height + 20);
+                // Draw some sim data
+                ctx.font = "10px monospace";
+                const sd = simDataRef.current;
+                ctx.fillText(`[${sd.slice(0,4).map(n => n.toFixed(2)).join(', ')}...]`, textX, textY + box.height + 35);
+            }
+            ctx.restore();
+          }
+        }
+        
+        if (scanStateRef.current === "idle") {
+          triggerAutoScanRef.current();
+        }
       }
 
       animationFrameId = requestAnimationFrame(detectAndDraw);
@@ -117,14 +157,14 @@ export default function Home() {
   };
 
   const captureFrame = (): string | null => {
-    if (!videoRef.current) return null;
+    if (!imageRef.current) return null;
     const canvas = document.createElement("canvas");
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
+    canvas.width = imageRef.current.width || 640;
+    canvas.height = imageRef.current.height || 480;
     const ctx = canvas.getContext("2d");
     if (ctx) {
       // Draw image normally (it's flipped in CSS but here we just grab the raw pixels)
-      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+      ctx.drawImage(imageRef.current, 0, 0, canvas.width, canvas.height);
       return canvas.toDataURL("image/jpeg", 0.9);
     }
     return null;
@@ -160,27 +200,65 @@ export default function Home() {
     }
   };
 
-  const handleAttendance = async () => {
+  const triggerAutoScanRef = useRef<() => void>(() => {});
+  
+  triggerAutoScanRef.current = async () => {
+    if (scanStateRef.current !== "idle") return;
+    
     const frame = captureFrame();
     if (!frame) return;
 
-    setStatus({ type: "info", msg: "Identifying..." });
+    setScanState("detecting");
+    
+    // Simulate detecting
+    await new Promise(r => setTimeout(r, 600));
+    
+    if (scanStateRef.current !== "detecting") return;
+    
+    setScanState("extracting");
+    
     try {
       const formData = new FormData();
       formData.append("image", frame);
 
+      // Hit the attendance endpoint to get the real embedding
       const res = await fetch("http://localhost:8000/attendance", {
         method: "POST",
         body: formData,
       });
       const data = await res.json();
-      if (res.ok) {
+      
+      if (data.embedding) {
+          setSimData(data.embedding);
+      } else {
+          setSimData(Array.from({length: 16}, () => Math.random()));
+      }
+
+      // Show extracting state with the REAL data for a moment
+      await new Promise(r => setTimeout(r, 800));
+      if (scanStateRef.current !== "extracting") return;
+
+      setScanState("verifying");
+      await new Promise(r => setTimeout(r, 600));
+      if (scanStateRef.current !== "verifying") return;
+
+      if (res.ok && data.status === "success") {
         setStatus({ type: "success", msg: data.message });
+        setVerifiedName(data.user);
+        setScanState("success");
+        setTimeout(() => {
+           setScanState("idle");
+           setVerifiedName("");
+        }, 4000);
       } else {
         setStatus({ type: "error", msg: data.detail || "Identification failed." });
+        setScanState("error");
+        setTimeout(() => setScanState("idle"), 2000);
       }
     } catch (err) {
       setStatus({ type: "error", msg: "Network error. Make sure backend is running." });
+      setScanState("error");
+      setTimeout(() => setScanState("idle"), 2000);
     }
   };
 
@@ -195,20 +273,14 @@ export default function Home() {
           </div>
 
           <div className="relative w-full aspect-video flex items-center justify-center">
-            {/* The Video Element */}
-            <video
-              ref={videoRef}
-              onPlay={handleVideoPlay}
-              onLoadedMetadata={() => {
-                if (videoRef.current && canvasRef.current) {
-                  canvasRef.current.width = videoRef.current.videoWidth;
-                  canvasRef.current.height = videoRef.current.videoHeight;
-                }
-              }}
-              autoPlay
-              playsInline
-              muted
+            {/* The Image Element receiving MJPEG */}
+            <img
+              ref={imageRef}
+              src="http://localhost:8000/video_feed"
+              crossOrigin="anonymous"
+              onLoad={handleImageLoad}
               className="w-full h-full object-cover transform scale-x-[-1]"
+              alt="Scanner Feed"
             />
             {/* The Canvas Overlay for "Dots" */}
             <canvas
@@ -223,11 +295,11 @@ export default function Home() {
             <select 
               className="select select-bordered select-sm w-full bg-base-100/50 backdrop-blur"
               value={selectedDevice}
-              onChange={(e) => setSelectedDevice(e.target.value)}
+              onChange={(e) => setSelectedDevice(Number(e.target.value))}
             >
-              {devices.map((d, i) => (
-                <option key={d.deviceId} value={d.deviceId} className="text-base-content">
-                  {d.label || `Camera ${i + 1}`}
+              {devices.map((idx) => (
+                <option key={idx} value={idx} className="text-base-content">
+                  Camera {idx} {idx === 1 || idx === 2 ? '(Possible IR)' : ''}
                 </option>
               ))}
             </select>
@@ -252,21 +324,58 @@ export default function Home() {
               </div>
             )}
 
-            {/* Attendance Action */}
-            <div className="form-control">
-              <label className="label">
-                <span className="label-text font-semibold">Verify Identity</span>
-              </label>
-              <button 
-                onClick={handleAttendance}
-                className="btn btn-primary btn-block shadow-lg"
-                disabled={!modelsLoaded}
-              >
-                Mark Attendance
-              </button>
+            {/* Simulation Status */}
+            <div className="bg-base-200 rounded-xl p-4 border border-base-content/5 relative overflow-hidden shadow-inner">
+              <h3 className="font-mono text-sm opacity-50 mb-4 flex justify-between">
+                <span>SYSTEM.STATUS</span>
+                <span className={scanState === 'idle' ? 'text-info' : scanState === 'success' ? 'text-success' : scanState === 'error' ? 'text-error' : 'text-warning'}>
+                  [{scanState.toUpperCase()}]
+                </span>
+              </h3>
+              
+              <div className="space-y-4 font-mono text-xs">
+                {/* Simulated Logs */}
+                <div className="flex items-center gap-3">
+                  <span className={`w-2 h-2 rounded-full ${scanState !== 'idle' ? 'bg-primary animate-pulse shadow-[0_0_8px_rgba(var(--p),1)]' : 'bg-base-content/20'}`}></span>
+                  <span className={scanState !== 'idle' ? 'text-primary font-bold' : 'opacity-50'}>1. Face Detection & Alignment</span>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <span className={`w-2 h-2 rounded-full ${scanState === 'extracting' || scanState === 'verifying' || scanState === 'success' ? 'bg-primary animate-pulse shadow-[0_0_8px_rgba(var(--p),1)]' : 'bg-base-content/20'}`}></span>
+                  <span className={scanState === 'extracting' || scanState === 'verifying' || scanState === 'success' ? 'text-primary font-bold' : 'opacity-50'}>
+                    2. CNN Feature Extraction (128D)
+                  </span>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <span className={`w-2 h-2 rounded-full ${scanState === 'verifying' || scanState === 'success' ? 'bg-primary animate-pulse shadow-[0_0_8px_rgba(var(--p),1)]' : 'bg-base-content/20'}`}></span>
+                  <span className={scanState === 'verifying' || scanState === 'success' ? 'text-primary font-bold' : 'opacity-50'}>
+                    3. Vector Distance Calculation
+                  </span>
+                </div>
+              </div>
+
+              {scanState === 'extracting' && simData.length > 0 && (
+                <div className="mt-4 p-2 bg-black/80 rounded font-mono text-[10px] text-error/80 grid grid-cols-4 gap-1 h-20 overflow-hidden relative">
+                  <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/80 z-10 pointer-events-none"></div>
+                  {simData.map((val, i) => (
+                    <span key={i} className="animate-pulse">{val.toFixed(4)}</span>
+                  ))}
+                  {simData.map((val, i) => (
+                    <span key={i + 16} className="animate-pulse opacity-50">{(val * 0.5).toFixed(4)}</span>
+                  ))}
+                </div>
+              )}
+
+              {scanState === 'success' && verifiedName && (
+                <div className="mt-4 p-4 bg-success/10 border border-success/30 rounded-lg text-center animate-[pulse_2s_ease-in-out_infinite]">
+                  <div className="text-success font-bold text-xl mb-1">ACCESS GRANTED</div>
+                  <div className="text-base-content font-semibold">Welcome, {verifiedName}</div>
+                </div>
+              )}
             </div>
 
-            <div className="divider">OR</div>
+            <div className="divider">MANUAL REGISTRATION</div>
 
             {/* Registration Action */}
             <div className="form-control gap-2">
